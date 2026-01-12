@@ -1,0 +1,15 @@
+venv/
+env/
+
+voteblock/__pycache__/
+*.pyc
+
+.mypy_cache/
+
+node_key.json
+voter_key.json
+*.key
+*.pem
+
+*.log
+*.sqlite3
