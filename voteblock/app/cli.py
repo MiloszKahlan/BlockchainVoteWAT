@@ -11,7 +11,6 @@ API_URL = "http://localhost:8000/api"
 KEY_FILE = "voter_key.json"
 
 
-
 def load_keys():
     """Wczytuje parę kluczy z pliku JSON."""
     try:
@@ -24,11 +23,7 @@ def load_keys():
 
 
 def _tx_payload_canonical(tx_dict: Dict) -> bytes:
-    """
-    Tworzy kanoniczną postać danych do podpisu.
-    UWAGA: Musi być IDENTYCZNA jak w blockchain.py (funkcja _tx_payload).
-    W przeciwnym razie weryfikacja na serwerze się nie uda.
-    """
+    """Tworzy kanoniczną postać danych do podpisu. Zgodne z formatem węzła."""
     d = {
         "election_id": tx_dict["election_id"],
         "voter_pubkey": tx_dict["voter_pubkey"],
@@ -37,7 +32,6 @@ def _tx_payload_canonical(tx_dict: Dict) -> bytes:
         "timestamp": tx_dict["timestamp"],
     }
     return json.dumps(d, sort_keys=True).encode()
-
 
 
 def cmd_keygen(args):
@@ -62,7 +56,7 @@ def cmd_create_election(args):
 
 
 def cmd_register(args):
-    """Admin: Rejestruje wyborców (dodaje do whitelist)."""
+    """Admin: Dodaje wyborców do listy uprawnionych (whitelist)."""
     keys = [k.strip() for k in args.pubkeys.split(",")]
     payload = {"voters_pubkeys": keys}
     r = requests.post(f"{API_URL}/elections/{args.id}/registry", json=payload)
@@ -73,70 +67,59 @@ def cmd_register(args):
 
 
 def cmd_set_validator(args):
-    """Node Operator: Ustawia listę walidatorów."""
+    """Admin: Ustawia walidatora w węźle."""
     payload = {"validators": [args.pubkey]}
     r = requests.post(f"{API_URL}/validators", json=payload)
     print(f"Odp serwera: {r.json()}")
 
 
 def cmd_vote(args):
-    """User: Oddaje głos (tworzy transakcję, podpisuje i wysyła)."""
+    """
+    User: Pobiera status licznika, inkrementuje go (obsługa Revoting),
+    podpisuje transakcję i przesyła do Mempoola.
+    """
     priv_key, pub_key = load_keys()
+    calculated_nonce = 0
+
+    try:
+        r_nonce = requests.get(f"{API_URL}/verify-vote/{args.election_id}", params={"voter_pubkey": pub_key})
+        if r_nonce.status_code == 200:
+            print("[*] Wykryto istniejący głos w łańcuchu. Inkrementacja licznika (Revoting)...")
+            calculated_nonce = 1
+        else:
+            calculated_nonce = 0
+    except Exception:
+        calculated_nonce = 0
 
     tx_data = {
         "election_id": args.election_id,
         "voter_pubkey": pub_key,
         "candidate_id": args.candidate,
-        "nonce": int(time.time() * 1000),
+        "nonce": calculated_nonce,
         "timestamp": int(time.time()),
     }
 
     payload_bytes = _tx_payload_canonical(tx_data)
     signature = sign(priv_key, payload_bytes)
-
     tx_data["signature"] = signature
 
-    print(f"[*] Wysyłanie głosu na kandydata '{args.candidate}'...")
+    print(f"[*] Wysyłanie głosu na kandydata '{args.candidate}' z nonce={calculated_nonce}...")
     try:
         r = requests.post(f"{API_URL}/tx", json=tx_data)
         if r.status_code == 200:
             resp = r.json()
-            if resp["accepted"]:
-                print(f"[+] Głos przyjęty do Mempoola! Status: {resp['tx_hash']}")
+            if resp.get("accepted", True):
+                print(f"[+] Głos przyjęty do Mempoola! Status: {resp.get('tx_hash', 'pending')}")
             else:
-                print(f"[-] Głos odrzucony przez węzeł: {resp['reason']}")
+                print(f"[-] Głos odrzucony przez węzeł: {resp.get('reason', 'unknown')}")
         else:
-            print(f"[-] Błąd HTTP: {r.text}")
+            print(f"[-] Błąd HTTP {r.status_code}: {r.text}")
     except Exception as e:
         print(f"[-] Błąd połączenia: {e}")
 
 
-def cmd_mine(args):
-    """
-    Node Operator: Wymusza utworzenie i finalizację bloku.
-    W systemie produkcyjnym działo by się to automatycznie co X sekund.
-    W pracy dyplomowej pokazujemy to jako ręczny krok 'symulacji'.
-    """
-    print("[*] Proponowanie bloku (Propose)...")
-    r1 = requests.post(f"{API_URL}/propose", json={})
-    if r1.status_code != 200:
-        print(f"[-] Błąd Propose: {r1.text}")
-        return
-
-    block_data = r1.json()
-    tx_count = block_data.get("tx_count", 0)
-    print(f"    Utworzono kandydat na blok. Liczba transakcji: {tx_count}")
-
-    print(
-        "[-] Aby sfinalizować blok w tym demo, użyj wbudowanego w API mechanizmu 'auto-mine' lub Swaggera."
-    )
-    print("    (W pełnej wersji P2P blok byłby rozgłaszany automatycznie).")
-
-    pass
-
-
 def cmd_results(args):
-    """Pobiera i wyświetla wyniki."""
+    """Pobiera i wyświetla wyniki z łańcucha."""
     r = requests.get(f"{API_URL}/results/{args.id}")
     if r.status_code == 200:
         res = r.json()
@@ -148,10 +131,9 @@ def cmd_results(args):
 
 
 def cmd_info(args):
-    """Status łańcucha."""
+    """Zwraca status lokalnego węzła."""
     r = requests.get(f"{API_URL}/chain")
     print(json.dumps(r.json(), indent=2))
-
 
 
 def main():
@@ -170,7 +152,7 @@ def main():
     p_reg = subparsers.add_parser("register", help="Zarejestruj wyborcę (Admin)")
     p_reg.add_argument("id", help="ID wyborów")
     p_reg.add_argument("pubkeys", help="Klucz(e) publiczne po przecinku")
-    p_reg.set_defaults(func=cmd_register)
+    p_reg.set_defaults(func=cmd_reg)
 
     p_val = subparsers.add_parser("set-validator", help="Ustaw walidatora (Admin)")
     p_val.add_argument("pubkey", help="Klucz publiczny węzła")
@@ -184,9 +166,9 @@ def main():
     p_info = subparsers.add_parser("info", help="Pokaż stan łańcucha")
     p_info.set_defaults(func=cmd_info)
 
-    p_res = subparsers.add_parser("results", help="Pokaż wyniki")
-    p_res.add_argument("id", help="ID wyborów")
-    p_res.set_defaults(func=cmd_results)
+    p_sub_res = subparsers.add_parser("results", help="Pokaż wyniki")
+    p_sub_res.add_argument("id", help="ID wyborów")
+    p_sub_res.set_defaults(func=cmd_results)
 
     args = parser.parse_args()
     try:

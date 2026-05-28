@@ -11,14 +11,13 @@ STATE_FILE = os.path.join(DATA_DIR, "state_config.json")
 
 
 class ChainState:
+    """Zarządza globalnym stanem węzła, w tym pamięcią trwałą i rejestrem wyborców."""
+
     def __init__(self):
         self.chain: List[Block] = []
-
         self._elections: Dict[str, Dict] = {}
-
-        self._voters_who_voted: Set[tuple] = set()
-
         self._validators: List[str] = []
+        self._last_nonces: Dict[str, int] = {}
 
         self._ensure_data_dir()
         self.load_state()
@@ -28,24 +27,36 @@ class ChainState:
         if not os.path.exists(DATA_DIR):
             os.makedirs(DATA_DIR)
 
-
     @property
     def last_hash(self) -> str:
-        """Zwraca hash ostatniego bloku lub '0' jeśli łańcuch jest pusty."""
+        """Zwraca skrót ostatniego bloku lub skrót wyzerowany, jeśli łańcuch jest pusty."""
         if not self.chain:
-            return "0" * 64  # Genesis prev_hash
+            return "0" * 64  
         return self.chain[-1].block_hash
 
     def get_chain_height(self) -> int:
         return len(self.chain)
 
+    # --- Zarządzanie Nonce (Replay Attack Protection) ---
+
+    def get_last_nonce(self, pubkey: str) -> int:
+        """Zwraca ostatni użyty nonce dla danego klucza lub -1 w przypadku jego braku."""
+        return self._last_nonces.get(pubkey, -1)
+
+    def update_nonce(self, pubkey: str, nonce: int):
+        self._last_nonces[pubkey] = nonce
+
+    # --- Operacje na łańcuchu ---
+
     def append_block(self, block: Block):
-        """Dodaje blok do pamięci i zapisuje łańcuch na dysk."""
+        """Osadza blok w łańcuchu lokalnym i aktualizuje stan w pamięci."""
         self.chain.append(block)
         self.save_chain()
         for tx in block.txs:
-            self.mark_voted(tx.election_id, tx.voter_pubkey)
+            # Usunięto mark_voted, zostawiamy tylko aktualizację nonce
+            self.update_nonce(tx.voter_pubkey, tx.nonce)
 
+    # --- Zarządzanie wyborami i walidatorami ---
 
     def create_election(self, election_id: str, candidates: List[str]):
         self._elections[election_id] = {
@@ -68,15 +79,7 @@ class ChainState:
         if election_id not in self._elections:
             return False
         whitelist = self._elections[election_id]["whitelist"]
-        if not whitelist:
-            return False
-        return pubkey in whitelist
-
-    def has_voted(self, election_id: str, pubkey: str) -> bool:
-        return (election_id, pubkey) in self._voters_who_voted
-
-    def mark_voted(self, election_id: str, pubkey: str):
-        self._voters_who_voted.add((election_id, pubkey))
+        return pubkey in whitelist if whitelist else False
 
     def set_validators(self, validators: List[str]):
         self._validators = validators
@@ -86,24 +89,39 @@ class ChainState:
         return self._validators
 
     def count_votes(self, election_id: str) -> Dict[str, int]:
-        """Zlicza głosy przeglądając cały łańcuch bloków."""
-        results = {c: 0 for c in self.candidates(election_id)}
+        """
+        Zlicza głosy. Wykorzystuje logikę Revoting, uwzględniając 
+        wyłącznie transakcję z najwyższym licznikiem nonce dla każdego wyborcy.
+        """
+        latest_votes: Dict[str, tuple] = {}
 
         for block in self.chain:
             for tx in block.txs:
                 if tx.election_id == election_id:
-                    if tx.candidate_id in results:
-                        results[tx.candidate_id] += 1
+                    voter = tx.voter_pubkey
+                    if voter not in latest_votes or tx.nonce > latest_votes[voter][0]:
+                        latest_votes[voter] = (tx.nonce, tx.candidate_id)
+
+        results = {c: 0 for c in self.candidates(election_id)}
+        for _, candidate_id in latest_votes.values():
+            if candidate_id in results:
+                results[candidate_id] += 1
         return results
 
+    # --- Persistence (Zapis/Odczyt) ---
 
     def save_state(self):
-        """Zapisuje konfigurację wyborów i walidatorów."""
-        data = {"elections": self._elections, "validators": self._validators}
+        """Zapisuje bieżącą konfigurację węzła do pliku JSON."""
+        data = {
+            "elections": self._elections, 
+            "validators": self._validators,
+            "nonces": self._last_nonces  
+        }
         with open(STATE_FILE, "w") as f:
             json.dump(data, f, indent=2)
 
     def load_state(self):
+        """Wczytuje konfigurację węzła z pliku JSON."""
         if not os.path.exists(STATE_FILE):
             return
         try:
@@ -111,17 +129,18 @@ class ChainState:
                 data = json.load(f)
                 self._elections = data.get("elections", {})
                 self._validators = data.get("validators", [])
+                self._last_nonces = data.get("nonces", {})
         except json.JSONDecodeError:
             print("Błąd odczytu pliku stanu.")
 
     def save_chain(self):
-        """Zapisuje listę bloków do pliku JSON."""
+        """Zapisuje strukturę łańcucha do pliku."""
         chain_data = [asdict(b) for b in self.chain]
         with open(CHAIN_FILE, "w") as f:
             json.dump(chain_data, f, indent=2)
 
     def load_chain(self):
-        """Wczytuje łańcuch i odtwarza stan głosowania (kto głosował)."""
+        """Odtwarza pełny stan rejestru bloków (State Replay)."""
         if not os.path.exists(CHAIN_FILE):
             return
         try:
@@ -129,7 +148,7 @@ class ChainState:
                 chain_data = json.load(f)
 
             self.chain = []
-            self._voters_who_voted.clear()
+            self._last_nonces.clear() 
 
             for b_data in chain_data:
                 txs_objs = [VoteTx(**tx) for tx in b_data["txs"]]
@@ -147,9 +166,10 @@ class ChainState:
                 self.chain.append(block)
 
                 for tx in block.txs:
-                    self.mark_voted(tx.election_id, tx.voter_pubkey)
+                    # Usunięto mark_voted, zostawiamy tylko aktualizację nonce
+                    self.update_nonce(tx.voter_pubkey, tx.nonce)
 
-            print(f"Załadowano łańcuch: {len(self.chain)} bloków.")
+            print(f"Załadowano łańcuch: {len(self.chain)} bloków. Odtworzono {len(self._last_nonces)} rekordów nonce.")
 
         except json.JSONDecodeError:
             print("Błąd odczytu pliku łańcucha.")

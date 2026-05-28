@@ -13,38 +13,29 @@ class PoALite:
         self.state = state
 
     def is_validator(self, pubkey: str) -> bool:
-        """Sprawdza, czy dany klucz publiczny znajduje się na liście autoryzowanych walidatorów."""
+        """Sprawdza, czy klucz publiczny należy do autoryzowanych walidatorów."""
         validators = self.state.get_validators()
         if not validators:
             return True
         return pubkey in validators
 
     def sign_block(self, block: Block, priv_key: str, pub_key: str):
-        """
-        Podpisuje blok kluczem prywatnym walidatora.
-        Podpis jest dodawany do listy `validator_signatures` wewnątrz bloku.
-
-        Args:
-            block: Obiekt bloku do podpisania.
-            priv_key: Klucz prywatny walidatora (base64).
-            pub_key: Klucz publiczny walidatora (base64).
-        """
+        """Dodaje podpis cyfrowy walidatora do nagłówka bloku."""
         signature = sign(priv_key, block.block_hash.encode())
-
         sig_entry = {"pubkey": pub_key, "signature": signature}
-
         block.validator_signatures.append(sig_entry)
 
     def verify_proposer(self, block: Block) -> Tuple[bool, str]:
         """
-        Weryfikuje, czy twórca bloku (Proposer) jest uprawniony i czy podpisał blok.
+        Weryfikuje, czy proponujący blok (Proposer) jest na białej liście 
+        oraz czy jego podpis kryptograficzny pasuje do hasha bloku.
         """
         proposer_pub = block.proposer_pubkey
 
         if not self.is_validator(proposer_pub):
             return (
                 False,
-                f"Proposer {proposer_pub[:8]}... nie jest na liście walidatorów.",
+                f"Proposer {proposer_pub[:8]}... nie jest na liscie walidatorow.",
             )
 
         proposer_signature = None
@@ -54,20 +45,18 @@ class PoALite:
                 break
 
         if not proposer_signature:
-            return False, "Blok nie zawiera podpisu twórcy (Proposera)."
+            return False, "Blok nie zawiera podpisu tworcy (Proposera)."
 
         if not verify(proposer_pub, block.block_hash.encode(), proposer_signature):
-            return False, "Podpis kryptograficzny Proposera jest nieprawidłowy."
+            return False, "Podpis kryptograficzny Proposera jest nieprawidlowy."
 
         return True, "OK"
 
     def verify_quorum(self, block: Block) -> bool:
-        """
-        Sprawdza, czy blok posiada wystarczającą liczbę podpisów od różnych walidatorów.
-        """
+        """Weryfikuje, czy blok osiągnął kworum podpisów (powyżej 50% walidatorów)."""
         validators = self.state.get_validators()
         if not validators:
-            return True  # Tryb dev
+            return True  
 
         required_votes = (len(validators) // 2) + 1
         valid_votes = 0
